@@ -1,0 +1,81 @@
+// Job Params
+// Requires: PYTEST_OPTIONS, CATTLE_TEST_URL, ADMIN_TOKEN
+// Optional: AWS_SSH_PEM_KEY, AWS_SSH_KEY_NAME, DEBUG
+
+node {
+  def rootPath = "/src/rancher-validation/"
+  def setupContainer = "${JOB_NAME}${env.BUILD_NUMBER}_setup"
+  def testContainer = "${JOB_NAME}${env.BUILD_NUMBER}_test"
+
+  def setupResultsOut = "setup-results.xml"
+  def testResultsOut = "results.xml"
+  def imageName = "rancher-validation-tests"
+  def testsDir = "tests/v3_api/"
+  def autoRun = "test_wl or test_dns_record or test_rbac or " +
+  "test_connectivity or test_ingress or test_secrets or " +
+  "test_registry or test_service_discovery"
+    def branch = "master"
+
+  if ("${env.branch}" != "null" && "${env.branch}" != "") {
+    branch = "${env.branch}"
+  }
+
+  wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'XTerm', 'defaultFg': 2, 'defaultBg':1]) {
+    stage('Checkout') {
+      deleteDir()
+      checkout([
+                $class: 'GitSCM',
+                branches: [[name: "*/${branch}"]],
+                extensions: scm.extensions + [[$class: 'CleanCheckout']],
+                userRemoteConfigs: scm.userRemoteConfigs
+              ])
+    }
+
+    stage('Configure and Build') {
+      sh "./tests/v3_api/scripts/configure.sh"
+      if (env.AWS_SSH_PEM_KEY && env.AWS_SSH_KEY_NAME) {
+        dir(".ssh") {
+          writeFile(file: "${env.AWS_SSH_KEY_NAME}", text: "${env.AWS_SSH_PEM_KEY}")
+        } 
+        sh "chmod 400 .ssh/*"
+      }
+      sh "./tests/v3_api/scripts/build.sh"
+    }
+    try {
+      parallel run1: {
+      stage('Run Validation Tests1') {
+        try {
+          sh "docker run --name ${setupContainer}_1  --env-file .env " +
+             "${imageName} /bin/bash -c \'pytest -v -s --junit-xml=${testResultsOut} ${PYTEST_OPTIONS} ${testsDir}\'"
+          sh "docker run --name ${testContainer}_1  --env-file .env " +
+             "${imageName} /bin/bash -c \'pytest -v -s " +
+             " --junit-xml=${testResultsOut} -k "+" \"${autoRun}\" " +
+             "${testsDir}\'"
+        } catch(err) {
+          echo 'Test run had failures. Collecting results...'
+        }},
+        run2: {
+      stage('Run Validation Tests2') {
+        try {
+          sh "docker run --name ${setupContainer}_2  --env-file .env " +
+             "${imageName} /bin/bash -c \'pytest -v -s --junit-xml=${testResultsOut} ${PYTEST_OPTIONS} ${testsDir}\'"
+          sh "docker run --name ${testContainer}_2  --env-file .env " +
+             "${imageName} /bin/bash -c \'pytest -v -s " +
+             " --junit-xml=${testResultsOut} -k "+" \"${autoRun}\" " +
+             "${testsDir}\'"
+        } catch(err) {
+          echo 'Test run had failures. Collecting results...'
+        }}
+      }
+
+      stage('Test Report') {
+        sh "docker cp ${testContainer}:${rootPath}${testResultsOut} ."
+        step([$class: 'JUnitResultArchiver', testResults: "**/${testResultsOut}"])
+        sh "docker rm -v ${testContainer}"
+      }
+    } catch(err){
+      sh "docker stop ${testContainer}"
+      sh "docker rm -v ${testContainer}"
+    }
+  }
+}
